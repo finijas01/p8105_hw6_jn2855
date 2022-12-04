@@ -1,0 +1,207 @@
+---
+title: "Homework 6"
+author: "Jasmine Niu (jn2855)"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(viridis)
+library(rvest)
+library(httr)
+library(modelr)
+
+knitr::opts_chunk$set(
+	echo = TRUE,
+	warning = FALSE,
+	fig.width = 8, 
+  fig.height = 6,
+  out.width = "90%"
+)
+
+options(
+  ggplot2.continuous.colour = "viridis",
+  ggplot2.continuous.fill = "viridis"
+)
+
+scale_colour_discrete = scale_colour_viridis_d
+scale_fill_discrete = scale_fill_viridis_d
+
+theme_set(theme_minimal() + theme(legend.position = "bottom"))
+```
+
+
+## Problem 1
+
+```{r weather_df, cache = TRUE}
+weather_df = 
+  rnoaa::meteo_pull_monitors(
+    c("USW00094728"),
+    var = c("PRCP", "TMIN", "TMAX"), 
+    date_min = "2017-01-01",
+    date_max = "2017-12-31") %>%
+  mutate(
+    name = recode(id, USW00094728 = "CentralPark_NY"),
+    tmin = tmin / 10,
+    tmax = tmax / 10) %>%
+  select(name, id, everything())
+```
+
+
+```{r}
+weather_df %>% 
+  modelr::bootstrap(n = 1000) %>% 
+  mutate(
+    models = map(strap, ~lm(tmax ~ tmin, data = .x) ),
+    results = map(models, broom::glance)) %>% 
+  select(-strap, -models) %>% 
+  unnest(results) %>% 
+  ggplot(aes(x = r.squared)) + geom_density()
+```
+
+
+```{r}
+weather_df %>% 
+  modelr::bootstrap(n = 1000) %>% 
+  mutate(
+    models = map(strap, ~lm(tmax ~ tmin, data = .x) ),
+    results = map(models, broom::tidy)) %>% 
+  select(-strap, -models) %>% 
+  unnest(results) %>% 
+  select(id = `.id`, term, estimate) %>% 
+  pivot_wider(
+    names_from = term, 
+    values_from = estimate) %>% 
+  rename(beta0 = `(Intercept)`, beta1 = tmin) %>% 
+  mutate(log_b0b1 = log(beta0 * beta1)) %>% 
+  ggplot(aes(x = log_b0b1)) + geom_density()
+```
+
+
+## Problem 2
+
+### Import the data and create a city_state variable
+
+```{r}
+url = "https://raw.githubusercontent.com/washingtonpost/data-homicides/cbcb572ed1a3c3f10d6dfe07e84464a28986173e/homicide-data.csv"
+
+df_base = read_csv(url)
+
+city_check = function(df){
+  
+  df_new = df %>% 
+    group_by(state) %>% 
+    count(city)
+  
+  df_new %>% 
+    knitr::kable()
+}
+
+
+city_check(df_base)
+```
+
+### Tidy the data
+
+```{r}
+df_tidy = df_base %>% 
+  mutate(
+    state = case_when(city == "Milwaukee" ~ "WI", TRUE ~ state),
+    city_state = paste(city, state, sep = ", "),
+    solution_status = ifelse(disposition == "Closed by arrest","solved","unsolved"),
+    victim_age = as.numeric(victim_age),
+    victim_race = fct_relevel(victim_race, "White"),
+    victim_sex = fct_relevel(victim_sex, "Female")
+  ) %>%
+  filter(!city_state %in%  c("Dallas, TX", "Phoenix, AZ", "Kansas City, MO", "Tulsa, AL") & 
+           victim_sex %in% c("Male", "Female") & 
+           victim_race %in% c("Black", "White"))
+```
+
+### Logistic regression on Baltimore
+
+```{r}
+reg_baltimore = df_tidy %>% 
+  filter(city == "Baltimore") %>% 
+  mutate(solution_status = fct_relevel(solution_status,"solved")) %>% 
+  glm(solution_status ~ victim_age + victim_sex + victim_race, data = ., family = binomial())
+
+save(reg_baltimore, file = "./result/reg_baltimore.RData")  
+  
+
+odds_ratio = reg_baltimore %>% 
+  broom::tidy() %>% 
+  mutate(
+    OR = exp(estimate),
+    CI_Lower = exp(estimate - 1.96*std.error),
+    CI_Upper = exp(estimate + 1.96*std.error)
+    ) %>%
+  select(term, estimate, OR, CI_Lower, CI_Upper) %>%
+  filter(term == "victim_sexMale")
+```
+
+### Logistic regression on all Cities
+
+```{r}
+reg_all = 
+  df_tidy %>% 
+  group_by(city_state) %>% 
+  mutate(
+    solution_status = ifelse(solution_status == "solved", 1, 0),
+    victim_sex = fct_relevel(victim_sex, "Female"),
+    victim_race = fct_relevel(victim_race, "White"),
+  ) %>% 
+  select(city_state, solution_status, victim_age, victim_sex, victim_race) %>% 
+  drop_na() %>% 
+  nest(data = -city_state) %>% 
+  mutate(
+    glm_all = map(.x = data, ~glm(solution_status ~ victim_age + victim_sex + victim_race, data = .x, family = binomial())),
+    tidy_output = map(.x = glm_all, ~broom::tidy(.x))) %>% 
+  select(city_state, tidy_output) %>% 
+  unnest(tidy_output) %>% 
+  mutate(
+    OR = exp(estimate),
+    CI_Lower = exp(estimate - 1.96*std.error),
+    CI_Upper = exp(estimate + 1.96*std.error)) %>%
+  filter(term == "victim_sexMale") %>% 
+  select(city_state, OR, CI_Lower, CI_Upper)
+
+```
+
+
+### Make a plot
+
+```{r}
+reg_all %>% 
+  ggplot(aes(x = fct_reorder(city_state, OR), y = OR)) +
+  geom_point(alpha = 0.5, color = "blue") +
+  geom_errorbar(aes(ymin = CI_Lower, ymax = CI_Upper)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(
+    title = "Estimated odds ratio for each city (with 95% confidence interval)",
+    x = "City",
+    y = "Estimated Odds Ratio"
+  )
+```
+
+
+
+## Problem 3
+
+### Clean the data
+
+```{r}
+df2 = read_csv("./data/birthweight.csv")
+
+apply(is.na(df2), 2, which)
+
+tibble(
+  variable = colnames(df2),
+  sapply(df2, class)) %>%
+  knitr::kable()
+
+df2_tidy = df2 %>%
+  mutate(parity_bin = case_when(parity == 0 ~ 0, TRUE ~ 1)) %>%
+  mutate(across(c(babysex, frace, malform, mrace, parity_bin), as.factor))  
+```
+
